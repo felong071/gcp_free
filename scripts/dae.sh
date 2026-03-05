@@ -226,49 +226,57 @@ check_local_version() {
     fi
 }
 
+normalize_version_tag() {
+    version_raw="$1"
+    version_raw="$(printf '%s' "$version_raw" | tr -d '[:space:]')"
+    version_raw="${version_raw#refs/tags/}"
+    if [ -z "$version_raw" ]; then
+        return 1
+    fi
+    case "$version_raw" in
+    v*)
+        latest_version="$version_raw"
+        ;;
+    *)
+        latest_version="v$version_raw"
+        ;;
+    esac
+    return 0
+}
+
 check_online_version() {
     if [ "$allow_prereleases" = 'yes' ]; then
-        if [ "$use_cdn" = 'yes' ]; then
-            tags_url="https://github.abskoop.workers.dev/https://github.com/daeuniverse/dae/tags"
-        else
-            tags_url="https://github.com/daeuniverse/dae/tags"
-        fi
-        temp_file="$(mktemp /tmp/dae.XXXXXX)"
-        if ! curl -s "$tags_url" -o "$temp_file"; then
-            echo_red "error: Failed to get the latest version of dae!"
-            echo_red "Please check your network and try again."
-            exit 1
-        else
-            latest_version="$(grep '/daeuniverse/dae/archive/refs/tags/' "$temp_file" | head -n 1 | awk -F '/tags/' '{print $2}' | awk -F '.zip' '{print $1}')"
-            rm "$temp_file"
-        fi
+        releases_api_url="https://api.github.com/repos/daeuniverse/dae/releases?per_page=1"
     else
-        if [ "$use_cdn" = 'yes' ]; then
-            releases_url="https://github.abskoop.workers.dev/https://github.com/daeuniverse/dae/releases/latest"
-        else
-            releases_url="https://github.com/daeuniverse/dae/releases/latest"
-        fi
-        temp_file="$(mktemp /tmp/dae.XXXXXX)"
-        if ! curl -sL "$releases_url" | \
-             grep '<h1 data-view-component="true" class="d-inline mr-3">' | \
-             awk -F ' <h1 data-view-component="true" class="d-inline mr-3">' '{print $2}' | \
-             awk -F '</h1>' '{print $1}' | \
-             tee "$temp_file" >> /dev/null; then
-            echo_red "error: Failed to get the latest version of dae!"
-            echo_red "Please check your network and try again."
-            exit 1
-        else
-            latest_version="$(cat "$temp_file" | head -n 1)"
-            rm "$temp_file"
-        fi
+        releases_api_url="https://api.github.com/repos/daeuniverse/dae/releases/latest"
+    fi
+    if [ "$use_cdn" = 'yes' ]; then
+        releases_api_url="https://github.abskoop.workers.dev/$releases_api_url"
+    fi
+    temp_file="$(mktemp /tmp/dae.XXXXXX)"
+    if ! curl -fsSL "$releases_api_url" -o "$temp_file"; then
+        echo_red "error: Failed to get the latest version of dae!"
+        echo_red "Please check your network and try again."
+        exit 1
+    fi
+    version_raw="$(awk -F'"tag_name"[[:space:]]*:[[:space:]]*"' 'NF>1{split($2,a,"\""); print a[1]; exit}' "$temp_file")"
+    rm -f "$temp_file"
+    if ! normalize_version_tag "$version_raw"; then
+        echo_red "error: Failed to parse the latest version of dae!"
+        echo_red "Please check your network and try again."
+        exit 1
     fi
 }
 
 compare_version() {
+    if [ -z "$latest_version" ]; then
+        echo_red "error: Latest version is empty, stop installation."
+        exit 1
+    fi
     if [ "$latest_version" = "$current_version" ]; then
         compare_status=0            # Don't need update
     elif  [ "$(echo "$current_version" | grep -Eo "v[0-9]+\.[0-9]+\.[0-9]+" )" = "$(echo "$latest_version" | grep -Eo "v[0-9]+\.[0-9]+\.[0-9]+")" ]; then
-        if ! grep -q -E 'rc' < "$latest_version"; then
+        if ! echo "$latest_version" | grep -q -E 'rc'; then
             compare_status=2        # Local version is less than remote version
         fi
     elif [ "$(printf '%s\n' "$current_version" "$latest_version" | sort -V | head -n1)" = "$current_version" ]; then
