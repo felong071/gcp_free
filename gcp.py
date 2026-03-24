@@ -5,7 +5,7 @@ import subprocess
 import sys
 import time
 import traceback
-import re
+import re  # 必须引入正则模块
 
 try:
     from google.cloud import compute_v1
@@ -37,17 +37,81 @@ REGION_OPTIONS = [
     {"name": "南卡罗来纳 (South Carolina)", "region": "us-east1", "default_zone": "us-east1-b"},
 ]
 
+# --- 动态获取镜像逻辑开始 ---
+
+def _fallback_os_images():
+    """当动态获取失败时的备用列表"""
+    return [
+        {"name": "Debian 12 (Bookworm)", "project": "debian-cloud", "family": "debian-12"},
+        {"name": "Debian 13 (Trixie)", "project": "debian-cloud", "family": "debian-13"},
+        {"name": "Ubuntu 22.04 LTS", "project": "ubuntu-os-cloud", "family": "ubuntu-2204-lts"},
+        {"name": "Ubuntu 24.04 LTS", "project": "ubuntu-os-cloud", "family": "ubuntu-2404-lts-amd64"},
+    ]
+
+def get_dynamic_os_images():
+    print_info("正在连接 GCP 动态获取最新的镜像列表，请稍候...")
+    try:
+        images_client = compute_v1.ImagesClient()
+    except Exception as e:
+        print_warning(f"客户端初始化失败: {e}")
+        return _fallback_os_images()
+        
+    projects_to_check = {
+        'debian-cloud': r'^debian-\d+$',
+        # 兼容 Ubuntu 24.04 及之后新引入的 -amd64 后缀命名规则
+        'ubuntu-os-cloud': r'^ubuntu-\d{4}(-lts)?(?:-amd64)?$'
+    }
+    
+    dynamic_options = []
+    
+    for project, pattern in projects_to_check.items():
+        try:
+            request = compute_v1.ListImagesRequest(project=project)
+            families = set()
+            
+            for image in images_client.list(request=request):
+                # 跳过官方标记为已废弃(deprecated)的镜像
+                if image.deprecated and image.deprecated.state and image.deprecated.state != "ACTIVE":
+                    continue
+                if image.family and re.match(pattern, image.family):
+                    families.add(image.family)
+                    
+            for family in sorted(list(families), reverse=True):
+                # 过滤掉显示名称中的 -amd64，让菜单看起来依然清爽
+                display_name = family.replace('-amd64', '').replace('-', ' ').title()
+                if 'Ubuntu' in display_name:
+                    display_name = display_name.replace('Lts', 'LTS')
+                    
+                dynamic_options.append({
+                    "name": display_name,
+                    "project": project,
+                    "family": family
+                })
+        except Exception as e:
+            print_warning(f"获取项目 {project} 的镜像失败: {e}")
+            
+    if not dynamic_options:
+        print_warning("未获取到动态镜像，正在使用备用默认列表...")
+        return _fallback_os_images()
+        
+    return dynamic_options
+
+# --- 动态获取镜像逻辑结束 ---
+
 def print_info(msg):
     print(f"[信息] {msg}")
     sys.stdout.flush()
+
 
 def print_success(msg):
     print(f"\033[92m[成功] {msg}\033[0m")
     sys.stdout.flush()
 
+
 def print_warning(msg):
     print(f"\033[93m[警告] {msg}\033[0m")
     sys.stdout.flush()
+
 
 def select_from_list(items, prompt_text, label_fn):
     print(f"\n--- {prompt_text} ---")
@@ -61,12 +125,14 @@ def select_from_list(items, prompt_text, label_fn):
                 return items[idx]
         print("输入无效，请重试。")
 
+
 def prompt_manual_project_id():
     while True:
         project_id = input("请输入项目 ID: ").strip()
         if project_id:
             return project_id
         print("输入不能为空，请重试。")
+
 
 def select_gcp_project():
     print_info("正在扫描您的项目列表...")
@@ -101,6 +167,7 @@ def select_gcp_project():
         print_warning(f"无法列出项目: {e}。请手动输入项目 ID。")
         return prompt_manual_project_id()
 
+
 def list_zones_for_region(project_id, region):
     zones_client = compute_v1.ZonesClient()
     zones = []
@@ -111,6 +178,7 @@ def list_zones_for_region(project_id, region):
         if zone_region == region:
             zones.append(zone.name)
     return sorted(zones)
+
 
 def select_zone(project_id):
     region_config = select_from_list(REGION_OPTIONS, "请选择部署区域", lambda r: r["name"])
@@ -130,66 +198,12 @@ def select_zone(project_id):
 
     return select_from_list(zones, f"请选择可用区 ({region})", lambda z: z)
 
-def get_dynamic_os_images():
-    print_info("正在连接 GCP 动态获取最新的 Ubuntu 和 Debian 镜像列表，请稍候...")
-    try:
-        images_client = compute_v1.ImagesClient()
-    except Exception as e:
-        print_warning(f"客户端初始化失败: {e}")
-        return _fallback_os_images()
-        
-    projects_to_check = {
-        'debian-cloud': r'^debian-\d+$',
-        # 兼容 Ubuntu 24.04 及之后新引入的 -amd64 后缀命名规则
-        'ubuntu-os-cloud': r'^ubuntu-\d{4}(-lts)?(?:-amd64)?$'
-    }
-    
-    dynamic_options = []
-    
-    for project, pattern in projects_to_check.items():
-        try:
-            request = compute_v1.ListImagesRequest(project=project)
-            families = set()
-            
-            for image in images_client.list(request=request):
-                # 跳过官方标记为已废弃的旧镜像
-                if image.deprecated and image.deprecated.state:
-                    continue
-                if image.family and re.match(pattern, image.family):
-                    families.add(image.family)
-                    
-            for family in sorted(list(families), reverse=True):
-                # 过滤掉显示名称中的 -amd64，让菜单看起来依然清爽
-                display_name = family.replace('-amd64', '').replace('-', ' ').title()
-                if 'Ubuntu' in display_name:
-                    display_name = display_name.replace('Lts', 'LTS')
-                    
-                dynamic_options.append({
-                    "name": display_name,
-                    "project": project,
-                    "family": family
-                })
-        except Exception as e:
-            print_warning(f"获取项目 {project} 的镜像失败: {e}")
-            
-    if not dynamic_options:
-        print_warning("未获取到动态镜像，正在使用备用默认列表...")
-        return _fallback_os_images()
-        
-    return dynamic_options
-
-def _fallback_os_images():
-    return [
-        {"name": "Debian 13 (Trixie)", "project": "debian-cloud", "family": "debian-13"},
-        {"name": "Debian 12 (Bookworm)", "project": "debian-cloud", "family": "debian-12"},
-        {"name": "Ubuntu 24.04 LTS", "project": "ubuntu-os-cloud", "family": "ubuntu-2404-lts-amd64"},
-        {"name": "Ubuntu 22.04 LTS", "project": "ubuntu-os-cloud", "family": "ubuntu-2204-lts"}
-    ]
 
 def select_os_image():
-    # 动态获取最新的镜像列表
+    # 改为动态获取最新的镜像列表
     os_options = get_dynamic_os_images()
     return select_from_list(os_options, "请选择操作系统", lambda o: o["name"])
+
 
 def create_instance(project_id, zone, os_config, instance_name="free-tier-vm"):
     instance_client = compute_v1.InstancesClient()
@@ -265,6 +279,7 @@ def create_instance(project_id, zone, os_config, instance_name="free-tier-vm"):
         print(f"\n[失败] 操作中止: {e}")
         traceback.print_exc()
 
+
 def list_instances(project_id):
     instance_client = compute_v1.InstancesClient()
     request = compute_v1.AggregatedListInstancesRequest(project=project_id)
@@ -299,6 +314,7 @@ def list_instances(project_id):
             )
     return instances
 
+
 def select_instance(project_id):
     instances = list_instances(project_id)
     if not instances:
@@ -319,13 +335,15 @@ def select_instance(project_id):
         choice = input(f"请输入数字选择 (1-{len(instances)}): ").strip()
         if choice.isdigit():
             idx = int(choice) - 1
-            if 0 <= idx < len(instances):
+            if 0 <= idx < len(items):
                 return instances[idx]
         print("输入无效，请重试。")
+
 
 def wait_for_operation(project_id, zone, operation_name):
     operation_client = compute_v1.ZoneOperationsClient()
     return operation_client.wait(project=project_id, zone=zone, operation=operation_name)
+
 
 def reroll_cpu_loop(project_id, instance_info):
     instance_name = instance_info["name"]
@@ -384,6 +402,7 @@ def reroll_cpu_loop(project_id, instance_info):
         attempt_counter += 1
         time.sleep(2)
 
+
 def read_cdn_ips(filename="cdnip.txt"):
     if not os.path.exists(filename):
         print(f"【错误】找不到文件: {filename}")
@@ -401,6 +420,7 @@ def read_cdn_ips(filename="cdnip.txt"):
     print(f"已从 {filename} 读取到 {len(ip_list)} 个 IP 段。")
     return ip_list
 
+
 def set_protocol_field(config_object, value):
     try:
         config_object.ip_protocol = value
@@ -411,6 +431,7 @@ def set_protocol_field(config_object, value):
             print(f"\n【调试信息】无法设置协议字段。对象 '{type(config_object).__name__}' 的有效属性如下:")
             print([d for d in dir(config_object) if not d.startswith("_")])
             raise
+
 
 def add_allow_all_ingress(project_id, network):
     firewall_client = compute_v1.FirewallsClient()
@@ -441,6 +462,7 @@ def add_allow_all_ingress(project_id, network):
         else:
             print(f"【失败】{e}")
             traceback.print_exc()
+
 
 def add_deny_cdn_egress(project_id, ip_ranges, network):
     if not ip_ranges:
@@ -476,6 +498,7 @@ def add_deny_cdn_egress(project_id, ip_ranges, network):
             print(f"【失败】{e}")
             traceback.print_exc()
 
+
 def configure_firewall(project_id, network):
     print("\n------------------------------------------------")
     print("防火墙规则管理菜单")
@@ -503,9 +526,11 @@ def configure_firewall(project_id, network):
 
     print("\n所有操作完成。")
 
+
 def is_not_found_error(exc):
     msg = str(exc).lower()
     return "notfound" in msg or "not found" in msg or "404" in msg
+
 
 def delete_firewall_rule(project_id, rule_name):
     firewall_client = compute_v1.FirewallsClient()
@@ -521,6 +546,7 @@ def delete_firewall_rule(project_id, rule_name):
             return True
         print_warning(f"删除防火墙规则失败: {rule_name} ({e})")
         return False
+
 
 def delete_disks_if_needed(project_id, zone, disk_names):
     if not disk_names:
@@ -539,6 +565,7 @@ def delete_disks_if_needed(project_id, zone, disk_names):
                 print_warning(f"删除磁盘失败: {disk_name} ({e})")
                 all_ok = False
     return all_ok
+
 
 def delete_free_resources(project_id, instance_info):
     instance_name = instance_info["name"]
@@ -585,6 +612,7 @@ def delete_free_resources(project_id, instance_info):
     print_success("清理完成。建议到控制台确认无残留资源。")
     return True
 
+
 def pick_remote_method():
     has_gcloud = shutil.which("gcloud") is not None
     has_ssh = shutil.which("ssh") is not None
@@ -608,6 +636,7 @@ def pick_remote_method():
     ssh_key = input("请输入 SSH 私钥路径 (留空表示使用默认密钥): ").strip()
     return {"method": "ssh", "user": ssh_user, "port": ssh_port, "key": ssh_key}
 
+
 def build_remote_download_command(script_url):
     return (
         "set -e;"
@@ -619,6 +648,7 @@ def build_remote_download_command(script_url):
         "sudo bash \"$tmp\";"
         "rm -f \"$tmp\""
     )
+
 
 def build_remote_exec_command(project_id, instance_info, remote_config, remote_command):
     instance_name = instance_info["name"]
@@ -655,6 +685,7 @@ def build_remote_exec_command(project_id, instance_info, remote_config, remote_c
 
     print_warning("远程执行方式未设置。")
     return None
+
 
 def build_remote_upload_command(project_id, instance_info, remote_config, local_path, remote_path):
     instance_name = instance_info["name"]
@@ -694,6 +725,7 @@ def build_remote_upload_command(project_id, instance_info, remote_config, local_
     print_warning("远程执行方式未设置。")
     return None
 
+
 def run_remote_script(project_id, instance_info, script_key, remote_config):
     script_url = REMOTE_SCRIPT_URLS.get(script_key)
     if not script_url:
@@ -716,6 +748,7 @@ def run_remote_script(project_id, instance_info, script_key, remote_config):
         print_warning(f"远程执行失败: {e}")
         return False
 
+
 def select_traffic_monitor_script():
     print("\n--- 请选择流量监控脚本 ---")
     print("[1] 安装 超额关闭 ssh 之外其他入站 (net_iptables.sh)")
@@ -730,6 +763,7 @@ def select_traffic_monitor_script():
         if choice == "0":
             return None
         print("输入无效，请重试。")
+
 
 def deploy_dae_config(project_id, instance_info, remote_config):
     local_config = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.dae")
@@ -782,6 +816,7 @@ def deploy_dae_config(project_id, instance_info, remote_config):
     except Exception as e:
         print_warning(f"配置应用失败: {e}")
         return False
+
 
 def main():
     print("GCP 免费服务器多功能管理工具")
@@ -871,6 +906,7 @@ def main():
             break
         else:
             print("输入无效，请重试。")
+
 
 if __name__ == "__main__":
     try:
