@@ -1,166 +1,125 @@
 import os
+import sys
 import time
 import json
+import getpass
+import shutil
 import traceback
 import subprocess
-import shutil
-import getpass
 from google.cloud import compute_v1
 
 # 配置常量
+MAX_RETRIES = 60  # CPU检测最大重试次数（2分钟）
 FIREWALL_RULES_TO_CLEAN = ["allow-all-ingress-custom", "deny-cdn-egress-custom"]
 REMOTE_SCRIPT_URLS = {
-    "apt": "https://raw.githubusercontent.com/your-repo/apt-source.sh",  # 替换为实际换源脚本地址
-    "dae": "https://raw.githubusercontent.com/your-repo/install-dae.sh",  # 替换为实际dae安装脚本地址
-    "net_iptables": "https://raw.githubusercontent.com/your-repo/net_iptables.sh",  # 流量监控脚本1
-    "net_shutdown": "https://raw.githubusercontent.com/your-repo/net_shutdown.sh",  # 流量监控脚本2
+    "apt": "https://raw.githubusercontent.com/xxx/debian-apt/main/apt.sh",  # 替换为实际换源脚本地址
+    "dae": "https://raw.githubusercontent.com/xxx/dae-install/main/install.sh",  # 替换为实际dae安装脚本地址
+    "net_iptables": "https://raw.githubusercontent.com/xxx/monitor/main/net_iptables.sh",  # 替换实际地址
+    "net_shutdown": "https://raw.githubusercontent.com/xxx/monitor/main/net_shutdown.sh",  # 替换实际地址
 }
 
-# 打印工具函数
+# 颜色输出函数
 def print_info(msg):
-    print(f"[信息] {msg}")
-
-def print_warning(msg):
-    print(f"[警告] {msg}")
+    print(f"\033[34m[INFO] {msg}\033[0m")
 
 def print_success(msg):
-    print(f"[成功] {msg}")
+    print(f"\033[32m[SUCCESS] {msg}\033[0m")
+
+def print_warning(msg):
+    print(f"\033[33m[WARNING] {msg}\033[0m")
+
+def print_error(msg):
+    print(f"\033[31m[ERROR] {msg}\033[0m")
 
 # 等待GCP操作完成
 def wait_for_operation(project_id, zone, operation_name):
     operation_client = compute_v1.ZoneOperationsClient()
     while True:
-        op = operation_client.get(project=project_id, zone=zone, operation=operation_name)
-        if op.status == compute_v1.Operation.Status.DONE:
-            if op.error:
-                raise Exception(f"操作失败: {op.error}")
+        operation = operation_client.get(project=project_id, zone=zone, operation=operation_name)
+        if operation.status == compute_v1.Operation.Status.DONE:
+            if operation.error:
+                raise Exception(f"操作失败: {operation.error}")
             return
         time.sleep(2)
 
 # 选择GCP项目
 def select_gcp_project():
-    project_client = compute_v1.ProjectsClient()
-    projects = list(project_client.list())
-    if not projects:
-        raise Exception("未找到GCP项目，请先配置gcloud认证")
-    
-    print("\n--- 请选择GCP项目 ---")
-    for idx, proj in enumerate(projects, 1):
-        print(f"[{idx}] {proj.project_id} ({proj.name})")
-    
-    while True:
-        choice = input("请输入数字选择项目: ").strip()
-        if choice.isdigit() and 1 <= int(choice) <= len(projects):
-            return projects[int(choice)-1].project_id
-        print("输入无效，请重试")
+    try:
+        # 尝试从gcloud获取项目列表
+        result = subprocess.run(
+            ["gcloud", "config", "list", "--format", "value(core.project)"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        default_project = result.stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        default_project = ""
 
-# 选择部署区域/可用区
+    print("\n--- 选择GCP项目 ---")
+    project_id = input(f"请输入GCP项目ID（默认: {default_project}）: ").strip()
+    if not project_id:
+        project_id = default_project
+    if not project_id:
+        print_error("项目ID不能为空！")
+        sys.exit(1)
+    return project_id
+
+# 选择可用区
 def select_zone(project_id):
-    # 定义区域映射
-    regions = {
-        "1": {"name": "俄勒冈 (Oregon)", "region": "us-west1"},
-        "2": {"name": "爱荷华 (Iowa)", "region": "us-central1"},
-        "3": {"name": "南卡罗来纳 (South Carolina)", "region": "us-east1"},
-    }
-    
-    print("\n--- 请选择部署区域 ---")
-    for k, v in regions.items():
-        print(f"[{k}] {v['name']}")
-    
-    while True:
-        region_choice = input("请输入数字选择 (1-3): ").strip()
-        if region_choice in regions:
-            target_region = regions[region_choice]["region"]
-            break
-        print("输入无效，请重试")
-
-    # 获取可用区列表
-    print_info(f"正在获取 {target_region} 的可用区列表...")
     zone_client = compute_v1.ZonesClient()
-    # 修复filter参数为filter_
-    zones = list(zone_client.list(project=project_id, filter_=f"region:(/{target_region})"))
-    zones = [z for z in zones if z.status == "UP"]
+    zones = zone_client.list(project=project_id)
+    available_zones = [zone.name for zone in zones if zone.status == "UP"]
     
-    print(f"\n--- 请选择可用区 ({target_region}) ---")
-    for idx, zone in enumerate(zones, 1):
-        print(f"[{idx}] {zone.name}")
+    print("\n--- 可用区列表 ---")
+    for idx, zone in enumerate(available_zones, 1):
+        print(f"[{idx}] {zone}")
     
     while True:
-        zone_choice = input("请输入数字选择: ").strip()
-        if zone_choice.isdigit() and 1 <= int(zone_choice) <= len(zones):
-            return zones[int(zone_choice)-1].name
-        print("输入无效，请重试")
+        choice = input("请选择可用区编号: ").strip()
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(available_zones):
+                return available_zones[idx]
+        except ValueError:
+            pass
+        print_error("无效选择，请重试！")
 
-# 选择操作系统镜像（核心修复：filter→filter_）
+# 选择操作系统镜像
 def select_os_image():
-    image_client = compute_v1.ImagesClient()
-    
-    # 获取Debian镜像
-    print_info("正在获取Debian镜像列表...")
-    try:
-        # 修复：filter → filter_
-        debian_images = list(image_client.list(
-            project="debian-cloud",
-            filter_="family:debian-12 AND status:READY"
-        ))
-        debian_images.sort(key=lambda x: x.creation_timestamp, reverse=True)
-    except Exception as e:
-        print_warning(f"获取debian-cloud镜像列表失败：{e}")
-        debian_images = []
-
-    # 获取Ubuntu镜像
-    print_info("正在获取Ubuntu镜像列表...")
-    try:
-        # 修复：filter → filter_
-        ubuntu_images = list(image_client.list(
-            project="ubuntu-os-cloud",
-            filter_="family:ubuntu-2204-lts AND status:READY"
-        ))
-        ubuntu_images.sort(key=lambda x: x.creation_timestamp, reverse=True)
-    except Exception as e:
-        print_warning(f"获取ubuntu-os-cloud镜像列表失败：{e}")
-        ubuntu_images = []
-
-    # 展示镜像选择
-    print("\n--- 请选择操作系统 ---")
-    os_choices = []
-    if debian_images:
-        os_choices.append(("1", f"Debian 12 ({debian_images[0].name})"))
-    if ubuntu_images:
-        os_choices.append(("2", f"Ubuntu 22.04 LTS ({ubuntu_images[0].name})"))
-    
-    if not os_choices:
-        raise Exception("未获取到可用的操作系统镜像")
-    
-    for k, v in os_choices:
-        print(f"[{k}] {v}")
+    print("\n--- 选择操作系统镜像 ---")
+    print("[1] Debian 12 (bookworm)")
+    print("[2] Ubuntu 22.04 LTS")
     
     while True:
-        choice = input("请输入数字选择操作系统: ").strip()
-        for k, v in os_choices:
-            if choice == k:
-                if k == "1":
-                    return {"family": "debian-12", "project": "debian-cloud"}
-                elif k == "2":
-                    return {"family": "ubuntu-2204-lts", "project": "ubuntu-os-cloud"}
-        print("输入无效，请重试")
+        choice = input("请选择镜像编号: ").strip()
+        if choice == "1":
+            return {
+                "family": "debian-12",
+                "project": "debian-cloud"
+            }
+        elif choice == "2":
+            return {
+                "family": "ubuntu-2204-lts",
+                "project": "ubuntu-os-cloud"
+            }
+        print_error("无效选择，请重试！")
 
-# 创建GCP实例
+# 创建实例
 def create_instance(project_id, zone, os_config):
-    instance_client = compute_v1.InstancesClient()
     instance_name = f"free-instance-{int(time.time())}"
-    
-    # 构建实例配置
+    instance_client = compute_v1.InstancesClient()
+
+    # 配置实例
     instance = compute_v1.Instance()
     instance.name = instance_name
-    instance.machine_type = f"zones/{zone}/machineTypes/e2-micro"  # 免费机型
+    instance.machine_type = f"zones/{zone}/machineTypes/e2-micro"
 
     # 配置引导磁盘
     disk = compute_v1.AttachedDisk()
     initialize_params = compute_v1.AttachedDiskInitializeParams()
     initialize_params.source_image = f"projects/{os_config['project']}/global/images/family/{os_config['family']}"
     initialize_params.disk_size_gb = 10
-    initialize_params.disk_type = f"zones/{zone}/diskTypes/pd-standard"
     disk.initialize_params = initialize_params
     disk.auto_delete = True
     disk.boot = True
@@ -168,18 +127,17 @@ def create_instance(project_id, zone, os_config):
 
     # 配置网络接口
     network_interface = compute_v1.NetworkInterface()
-    network_interface.name = "nic0"
-    network_interface.network = "global/networks/default"
+    network_interface.name = "global/networks/default"
     access_config = compute_v1.AccessConfig()
+    access_config.type_ = compute_v1.AccessConfig.Type.ONE_TO_ONE_NAT
     access_config.name = "External NAT"
-    access_config.type_ = "ONE_TO_ONE_NAT"
     network_interface.access_configs = [access_config]
     instance.network_interfaces = [network_interface]
 
     # 配置元数据（启用SSH）
     instance.metadata = compute_v1.Metadata()
     instance.metadata.items = [
-        compute_v1.Items(key="enable-oslogin", value="FALSE"),
+        compute_v1.Items(key="enable-oslogin", value="TRUE")
     ]
 
     # 创建实例
@@ -191,92 +149,100 @@ def create_instance(project_id, zone, os_config):
             instance_resource=instance
         )
         wait_for_operation(project_id, zone, operation.name)
-        print_success(f"实例 {instance_name} 创建成功！")
+        print_success(f"实例创建成功: {instance_name}")
         
         # 获取实例外网IP
         inst = instance_client.get(project=project_id, zone=zone, instance=instance_name)
-        ext_ip = inst.network_interfaces[0].access_configs[0].nat_ip
-        print_success(f"实例外网IP: {ext_ip}")
+        for interface in inst.network_interfaces:
+            for config in interface.access_configs:
+                if config.nat_ip:
+                    print_success(f"实例外网IP: {config.nat_ip}")
+                    break
         return instance_name
     except Exception as e:
-        print_warning(f"创建实例失败: {e}")
+        print_error(f"创建实例失败: {e}")
         traceback.print_exc()
         return None
 
-# 选择现有实例
+# 选择实例
 def select_instance(project_id):
     instance_client = compute_v1.InstancesClient()
     instances = []
-    zones = list(compute_v1.ZonesClient().list(project=project_id))
+    zones = compute_v1.ZonesClient().list(project=project_id)
     
-    print_info("正在获取实例列表...")
+    print("\n--- 可用实例列表 ---")
     for zone in zones:
+        if zone.status != "UP":
+            continue
         try:
-            # 修复：filter → filter_
-            zone_instances = list(instance_client.list(
-                project=project_id,
-                zone=zone.name,
-                filter_="machineType:(/e2-micro)"
-            ))
+            zone_instances = instance_client.list(project=project_id, zone=zone.name)
             for inst in zone_instances:
-                ext_ip = "-"
-                if inst.network_interfaces:
-                    for nic in inst.network_interfaces:
-                        if nic.access_configs:
-                            ext_ip = nic.access_configs[0].nat_ip
+                # 获取外网IP
+                external_ip = "-"
+                for interface in inst.network_interfaces:
+                    for config in interface.access_configs:
+                        if config.nat_ip:
+                            external_ip = config.nat_ip
                             break
+                
                 instances.append({
                     "name": inst.name,
                     "zone": zone.name,
                     "status": inst.status,
-                    "external_ip": ext_ip,
+                    "external_ip": external_ip,
                     "network": inst.network_interfaces[0].network if inst.network_interfaces else "global/networks/default"
                 })
         except Exception:
             continue
-    
+
     if not instances:
-        print_warning("未找到任何e2-micro实例")
+        print_warning("未找到任何实例！")
         return None
-    
-    print("\n--- 请选择服务器 ---")
+
     for idx, inst in enumerate(instances, 1):
-        print(f"[{idx}] {inst['name']} ({inst['zone']}) - {inst['status']} - IP: {inst['external_ip']}")
+        print(f"[{idx}] {inst['name']} | {inst['zone']} | 状态: {inst['status']} | IP: {inst['external_ip']}")
     
     while True:
-        choice = input("请输入数字选择: ").strip()
-        if choice.isdigit() and 1 <= int(choice) <= len(instances):
-            return instances[int(choice)-1]
-        print("输入无效，请重试")
+        choice = input("请选择实例编号: ").strip()
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(instances):
+                return instances[idx]
+        except ValueError:
+            pass
+        print_error("无效选择，请重试！")
 
-# 刷AMD CPU
+# 刷AMD CPU循环
 def reroll_cpu_loop(project_id, instance_info):
     instance_name = instance_info["name"]
     zone = instance_info["zone"]
-    max_attempts = 20
     attempt_counter = 0
-    max_retries = 60  # 2分钟超时
-    
-    print_info(f"开始刷AMD CPU，最多尝试 {max_attempts} 次...")
+    max_attempts = 20  # 最大重试次数
     instance_client = compute_v1.InstancesClient()
+
+    print_info(f"开始刷AMD CPU，实例: {instance_name} ({zone})")
+    print_info(f"最大尝试次数: {max_attempts}")
 
     while attempt_counter < max_attempts:
         attempt_counter += 1
-        print_info(f"\n=== 第 {attempt_counter}/{max_attempts} 次尝试 ===")
+        print_info(f"\n--- 第 {attempt_counter}/{max_attempts} 次尝试 ---")
 
-        # 重启实例
-        print_info(f"正在重启虚拟机 {instance_name}...")
+        # 启动实例（如果未运行）
         try:
-            op = instance_client.reset(project=project_id, zone=zone, instance=instance_name)
-            wait_for_operation(project_id, zone, op.name)
+            current_inst = instance_client.get(project=project_id, zone=zone, instance=instance_name)
+            if current_inst.status != "RUNNING":
+                print_info(f"启动实例 {instance_name}...")
+                op = instance_client.start(project=project_id, zone=zone, instance=instance_name)
+                wait_for_operation(project_id, zone, op.name)
         except Exception as e:
-            print_warning(f"重启失败: {e}")
-            time.sleep(5)
+            print_error(f"启动实例失败: {e}")
+            traceback.print_exc()
+            attempt_counter += 1
             continue
 
-        # 等待实例启动并检测CPU
-        current_platform = "Unknown CPU Platform"
-        for i in range(max_retries):
+        # 等待CPU信息同步
+        current_platform = None
+        for i in range(MAX_RETRIES):
             try:
                 current_inst = instance_client.get(project=project_id, zone=zone, instance=instance_name)
 
@@ -290,10 +256,10 @@ def reroll_cpu_loop(project_id, instance_info):
                     break
 
                 if (i + 1) % 5 == 0:
-                    print_info(f"正在等待 CPU 元数据同步... ({i+1}/{max_retries}) - 机器正在启动中")
+                    print_info(f"正在等待 CPU 元数据同步... ({i+1}/{MAX_RETRIES}) - 机器正在启动中")
                 time.sleep(2)
             except Exception as e:
-                print_warning(f"检测CPU时出错: {e}")
+                print_warning(f"获取实例信息失败: {e}")
                 time.sleep(2)
                 continue
 
@@ -302,21 +268,31 @@ def reroll_cpu_loop(project_id, instance_info):
         else:
             print_info(f"检测到 CPU: {current_platform}")
 
+        # 检查是否是AMD CPU
         if "AMD" in str(current_platform).upper():
             print_success(f"恭喜！已成功刷到目标 CPU: {current_platform}")
             print_info("脚本执行完毕。")
             break
 
+        # 重置实例（关停并启动）
         print_warning(f"结果不满意 ({current_platform})。准备重置...")
         print_info(f"正在关停虚拟机 {instance_name}...")
-        op = instance_client.stop(project=project_id, zone=zone, instance=instance_name)
-        wait_for_operation(project_id, zone, op.name)
-        time.sleep(2)
+        try:
+            op = instance_client.stop(project=project_id, zone=zone, instance=instance_name)
+            wait_for_operation(project_id, zone, op.name)
+            time.sleep(2)
+        except Exception as e:
+            print_error(f"关停实例失败: {e}")
+            traceback.print_exc()
+            continue
+
+    if attempt_counter >= max_attempts:
+        print_warning(f"已达到最大尝试次数 ({max_attempts})，停止刷CPU。")
 
 # 读取CDN IP列表
 def read_cdn_ips(filename="cdnip.txt"):
     if not os.path.exists(filename):
-        print(f"【错误】找不到文件: {filename}")
+        print_error(f"找不到文件: {filename}")
         print("请在脚本同目录下创建该文件，并填入IP段。")
         return []
 
@@ -324,14 +300,14 @@ def read_cdn_ips(filename="cdnip.txt"):
     with open(filename, "r", encoding="utf-8") as f:
         for line in f:
             clean_line = line.strip()
-            if clean_line:
+            if clean_line and not clean_line.startswith("#"):
                 ip = clean_line.split()[0]
                 ip_list.append(ip)
 
-    print(f"已从 {filename} 读取到 {len(ip_list)} 个 IP 段。")
+    print_info(f"已从 {filename} 读取到 {len(ip_list)} 个 IP 段。")
     return ip_list
 
-# 设置协议字段兼容
+# 设置协议字段（兼容不同版本SDK）
 def set_protocol_field(config_object, value):
     try:
         config_object.ip_protocol = value
@@ -339,7 +315,7 @@ def set_protocol_field(config_object, value):
         try:
             config_object.I_p_protocol = value
         except AttributeError:
-            print(f"\n【调试信息】无法设置协议字段。对象 '{type(config_object).__name__}' 的有效属性如下:")
+            print_error(f"\n无法设置协议字段。对象 '{type(config_object).__name__}' 的有效属性如下:")
             print([d for d in dir(config_object) if not d.startswith("_")])
             raise
 
@@ -348,7 +324,7 @@ def add_allow_all_ingress(project_id, network):
     firewall_client = compute_v1.FirewallsClient()
     rule_name = "allow-all-ingress-custom"
 
-    print(f"\n正在创建入站规则: {rule_name} ...")
+    print_info(f"\n正在创建入站规则: {rule_name} ...")
 
     firewall_rule = compute_v1.Firewall()
     firewall_rule.name = rule_name
@@ -363,7 +339,7 @@ def add_allow_all_ingress(project_id, network):
 
     try:
         operation = firewall_client.insert(project=project_id, firewall_resource=firewall_rule)
-        print("正在应用规则...")
+        print_info("正在应用规则...")
         operation_client = compute_v1.GlobalOperationsClient()
         operation_client.wait(project=project_id, operation=operation.name)
         print_success("已添加允许所有入站连接的规则。")
@@ -371,19 +347,19 @@ def add_allow_all_ingress(project_id, network):
         if "already exists" in str(e):
             print_warning(f"规则 {rule_name} 已存在。")
         else:
-            print(f"【失败】{e}")
+            print_error(f"添加入站规则失败: {e}")
             traceback.print_exc()
 
 # 添加拒绝CDN出站规则
 def add_deny_cdn_egress(project_id, ip_ranges, network):
     if not ip_ranges:
-        print("IP 列表为空，跳过创建拒绝规则。")
+        print_info("IP 列表为空，跳过创建拒绝规则。")
         return
 
     firewall_client = compute_v1.FirewallsClient()
     rule_name = "deny-cdn-egress-custom"
 
-    print(f"\n正在创建出站拒绝规则: {rule_name} ...")
+    print_info(f"\n正在创建出站拒绝规则: {rule_name} ...")
 
     firewall_rule = compute_v1.Firewall()
     firewall_rule.name = rule_name
@@ -398,7 +374,7 @@ def add_deny_cdn_egress(project_id, ip_ranges, network):
 
     try:
         operation = firewall_client.insert(project=project_id, firewall_resource=firewall_rule)
-        print("正在应用规则...")
+        print_info("正在应用规则...")
         operation_client = compute_v1.GlobalOperationsClient()
         operation_client.wait(project=project_id, operation=operation.name)
         print_success(f"已添加拒绝规则，共拦截 {len(ip_ranges)} 个 IP 段。")
@@ -406,10 +382,10 @@ def add_deny_cdn_egress(project_id, ip_ranges, network):
         if "already exists" in str(e):
             print_warning(f"规则 {rule_name} 已存在。")
         else:
-            print(f"【失败】{e}")
+            print_error(f"添加出站规则失败: {e}")
             traceback.print_exc()
 
-# 配置防火墙
+# 配置防火墙规则
 def configure_firewall(project_id, network):
     print("\n------------------------------------------------")
     print("防火墙规则管理菜单")
@@ -420,24 +396,24 @@ def configure_firewall(project_id, network):
     if choice_in == "y":
         add_allow_all_ingress(project_id, network)
     else:
-        print("已跳过入站规则配置。")
+        print_info("已跳过入站规则配置。")
 
     choice_out = input("\n[2/2] 是否添加【拒绝对 cdnip.txt 中 IP 的出站连接】规则? (y/n): ").strip().lower()
     if choice_out == "y":
         ips = read_cdn_ips()
         if ips:
             if len(ips) > 256:
-                print(f"【警告】IP 数量 ({len(ips)}) 超过 GCP 单条规则上限 (256)。")
+                print_warning(f"【警告】IP 数量 ({len(ips)}) 超过 GCP 单条规则上限 (256)。")
                 print("脚本将只取前 256 个 IP。")
                 ips = ips[:256]
 
             add_deny_cdn_egress(project_id, ips, network)
     else:
-        print("已跳过出站规则配置。")
+        print_info("已跳过出站规则配置。")
 
     print("\n所有操作完成。")
 
-# 检查是否为NotFound错误
+# 检查是否是未找到错误
 def is_not_found_error(exc):
     msg = str(exc).lower()
     return "notfound" in msg or "not found" in msg or "404" in msg
@@ -489,7 +465,7 @@ def delete_free_resources(project_id, instance_info):
     print(f"- 防火墙规则: {', '.join(FIREWALL_RULES_TO_CLEAN)}")
     confirm = input("请输入 DELETE 确认删除: ").strip()
     if confirm != "DELETE":
-        print("已取消删除操作。")
+        print_info("已取消删除操作。")
         return False
 
     instance_client = compute_v1.InstancesClient()
@@ -523,7 +499,7 @@ def delete_free_resources(project_id, instance_info):
     print_success("清理完成。建议到控制台确认无残留资源。")
     return True
 
-# 选择远程执行方式（gcloud/ssh）
+# 选择远程执行方式
 def pick_remote_method():
     has_gcloud = shutil.which("gcloud") is not None
     has_ssh = shutil.which("ssh") is not None
@@ -547,7 +523,7 @@ def pick_remote_method():
     ssh_key = input("请输入 SSH 私钥路径 (留空表示使用默认密钥): ").strip()
     return {"method": "ssh", "user": ssh_user, "port": ssh_port, "key": ssh_key}
 
-# 构建远程下载命令
+# 构建远程下载脚本命令
 def build_remote_download_command(script_url):
     return (
         "set -e;"
@@ -584,7 +560,7 @@ def build_remote_exec_command(project_id, instance_info, remote_config, remote_c
         if not host or host == "-":
             print_warning("该实例没有外网 IP，无法使用 SSH 直连。")
             return None
-        cmd = ["ssh"]
+        cmd = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10"]
         port = remote_config.get("port")
         if port:
             cmd += ["-p", str(port)]
@@ -597,7 +573,7 @@ def build_remote_exec_command(project_id, instance_info, remote_config, remote_c
     print_warning("远程执行方式未设置。")
     return None
 
-# 构建远程上传命令
+# 构建远程上传文件命令
 def build_remote_upload_command(project_id, instance_info, remote_config, local_path, remote_path):
     instance_name = instance_info["name"]
     zone = instance_info["zone"]
@@ -623,7 +599,7 @@ def build_remote_upload_command(project_id, instance_info, remote_config, local_
         if not host or host == "-":
             print_warning("该实例没有外网 IP，无法使用 SSH 直连。")
             return None
-        cmd = ["scp"]
+        cmd = ["scp", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10"]
         port = remote_config.get("port")
         if port:
             cmd += ["-P", str(port)]
@@ -649,14 +625,16 @@ def run_remote_script(project_id, instance_info, script_key, remote_config):
 
     print_info(f"正在远程执行脚本: {script_url}")
     try:
-        result = subprocess.run(cmd)
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if result.returncode == 0:
             print_success("远程脚本执行完成。")
             return True
         print_warning(f"远程脚本执行失败，退出码: {result.returncode}")
+        print_error(f"错误输出: {result.stderr}")
         return False
     except Exception as e:
         print_warning(f"远程执行失败: {e}")
+        traceback.print_exc()
         return False
 
 # 选择流量监控脚本
@@ -673,13 +651,14 @@ def select_traffic_monitor_script():
             return "net_shutdown"
         if choice == "0":
             return None
-        print("输入无效，请重试。")
+        print_error("输入无效，请重试。")
 
 # 部署dae配置
 def deploy_dae_config(project_id, instance_info, remote_config):
     local_config = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.dae")
     if not os.path.isfile(local_config):
         print_warning(f"找不到本地配置文件: {local_config}")
+        print_info("请确保 config.dae 文件在脚本同目录下")
         return False
 
     remote_tmp = "/tmp/config.dae"
@@ -695,12 +674,14 @@ def deploy_dae_config(project_id, instance_info, remote_config):
 
     print_info("正在上传 config.dae ...")
     try:
-        result = subprocess.run(upload_cmd)
+        result = subprocess.run(upload_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if result.returncode != 0:
             print_warning(f"上传失败，退出码: {result.returncode}")
+            print_error(f"错误输出: {result.stderr}")
             return False
     except Exception as e:
         print_warning(f"上传失败: {e}")
+        traceback.print_exc()
         return False
 
     remote_command = (
@@ -708,8 +689,8 @@ def deploy_dae_config(project_id, instance_info, remote_config):
         "sudo mkdir -p /usr/local/etc/dae;"
         "sudo cp /tmp/config.dae /usr/local/etc/dae/config.dae;"
         "sudo chmod 600 /usr/local/etc/dae/config.dae;"
-        "sudo systemctl enable dae;"
-        "sudo systemctl restart dae;"
+        "sudo systemctl enable dae || true;"
+        "sudo systemctl restart dae || true;"
         "rm -f /tmp/config.dae"
     )
     exec_cmd = build_remote_exec_command(project_id, instance_info, remote_config, remote_command)
@@ -718,19 +699,32 @@ def deploy_dae_config(project_id, instance_info, remote_config):
 
     print_info("正在应用配置并重启 dae ...")
     try:
-        result = subprocess.run(exec_cmd)
+        result = subprocess.run(exec_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if result.returncode == 0:
             print_success("配置已更新并重启 dae。")
             return True
         print_warning(f"配置应用失败，退出码: {result.returncode}")
+        print_error(f"错误输出: {result.stderr}")
         return False
     except Exception as e:
         print_warning(f"配置应用失败: {e}")
+        traceback.print_exc()
         return False
 
 # 主函数
 def main():
-    print("GCP 免费服务器多功能管理工具")
+    print("================================================")
+    print("        GCP 免费服务器多功能管理工具")
+    print("================================================")
+    
+    # 检查GCP认证
+    if not os.getenv("GOOGLE_APPLICATION_CREDENTIALS") and not shutil.which("gcloud"):
+        print_error("未检测到GCP认证！")
+        print_info("请先配置GCP认证：")
+        print_info("1. 设置环境变量: export GOOGLE_APPLICATION_CREDENTIALS='密钥文件路径'")
+        print_info("2. 或使用gcloud认证: gcloud auth application-default login")
+        sys.exit(1)
+
     project_id = select_gcp_project()
     current_instance = None
     remote_config = None
@@ -813,10 +807,10 @@ def main():
                 if delete_free_resources(project_id, current_instance):
                     current_instance = None
         elif choice == "0":
-            print("已退出。")
+            print_success("已退出。")
             break
         else:
-            print("输入无效，请重试。")
+            print_error("输入无效，请重试。")
 
 if __name__ == "__main__":
     try:
@@ -826,3 +820,4 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\n[错误] 发生异常: {e}")
         traceback.print_exc()
+        sys.exit(1)
