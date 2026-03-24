@@ -140,7 +140,8 @@ def get_dynamic_os_images():
         
     projects_to_check = {
         'debian-cloud': r'^debian-\d+$',
-        'ubuntu-os-cloud': r'^ubuntu-\d{4}-lts$|^ubuntu-\d{4}$'
+        # 兼容 Ubuntu 24.04 及之后新引入的 -amd64 后缀命名规则
+        'ubuntu-os-cloud': r'^ubuntu-\d{4}(-lts)?(?:-amd64)?$'
     }
     
     dynamic_options = []
@@ -151,14 +152,15 @@ def get_dynamic_os_images():
             families = set()
             
             for image in images_client.list(request=request):
-                # 跳过官方标记为已废弃的镜像
+                # 跳过官方标记为已废弃的旧镜像
                 if image.deprecated and image.deprecated.state:
                     continue
                 if image.family and re.match(pattern, image.family):
                     families.add(image.family)
                     
             for family in sorted(list(families), reverse=True):
-                display_name = family.replace('-', ' ').title()
+                # 过滤掉显示名称中的 -amd64，让菜单看起来依然清爽
+                display_name = family.replace('-amd64', '').replace('-', ' ').title()
                 if 'Ubuntu' in display_name:
                     display_name = display_name.replace('Lts', 'LTS')
                     
@@ -178,9 +180,9 @@ def get_dynamic_os_images():
 
 def _fallback_os_images():
     return [
-        {"name": "Debian 12 (Bookworm)", "project": "debian-cloud", "family": "debian-12"},
         {"name": "Debian 13 (Trixie)", "project": "debian-cloud", "family": "debian-13"},
-        {"name": "Ubuntu 24.04 LTS", "project": "ubuntu-os-cloud", "family": "ubuntu-2404-lts"},
+        {"name": "Debian 12 (Bookworm)", "project": "debian-cloud", "family": "debian-12"},
+        {"name": "Ubuntu 24.04 LTS", "project": "ubuntu-os-cloud", "family": "ubuntu-2404-lts-amd64"},
         {"name": "Ubuntu 22.04 LTS", "project": "ubuntu-os-cloud", "family": "ubuntu-2204-lts"}
     ]
 
